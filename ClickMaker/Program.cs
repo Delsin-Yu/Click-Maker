@@ -1,6 +1,7 @@
 ﻿using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Schema;
 using System.Text.Json.Serialization;
@@ -14,10 +15,26 @@ const string configFilePath = "Config.json";
 
 if (!File.Exists(configFilePath))
 {
-    var dummyConfig = new SoundConfigProfile([
-        new("Example1.mid", []),
-        new("Example2.mid", [1, 3])
-    ]);
+    var dummyConfig = new SoundConfigProfile(
+        [
+            new(
+                MidiFilePath: "Example1.mid",
+                ImportantBars: [],
+                PerBarSpecialHandling: null,
+                GlobalSpecialHandling: null,
+                SpecialCallout: [],
+                RestartCallout: []
+            ),
+            new(
+                MidiFilePath: "Example2.mid",
+                ImportantBars: [1, 3],
+                PerBarSpecialHandling: new() { { "100", [SpecialHandling.Handle68AsGroupOf3] } },
+                GlobalSpecialHandling: [SpecialHandling.Handle68AsGroupOf3],
+                SpecialCallout: [5, 6, 8],
+                RestartCallout: new() { { 1, 2 }, { 5, 1 } }
+            )
+        ]
+    );
     var dummyJson = JsonSerializer.Serialize(dummyConfig, SerializerContext.Default.SoundConfigProfile);
     File.WriteAllText(configFilePath, dummyJson);
     var schema = SerializerContext.Default.SoundConfigProfile.GetJsonSchemaAsNode().ToJsonString();
@@ -33,24 +50,37 @@ if (config.Configs.Length == 0)
     return;
 
 var cache = new Dictionary<int, AudioFileReaderAllocation>();
+var reportBuilder = new StringBuilder();
+string? firstFileDir = null;
 
-foreach (var (file, importantBars) in config.Configs)
+foreach (var soundConfig in config.Configs)
 {
-    var clicks = CreateClickInfo(file);
+    var midiFileName = Path.GetFileNameWithoutExtension(soundConfig.MidiFilePath);
+    firstFileDir ??= Path.GetDirectoryName(soundConfig.MidiFilePath);
+    reportBuilder.AppendLine(midiFileName);
+    var clicks = CreateClickInfo(soundConfig.MidiFilePath);
+    var barInfo = AnalyzeClickInfo(clicks, soundConfig.RestartCallout ?? []);
+    var barConfig = soundConfig.PerBarSpecialHandling?.ToDictionary(x => BarRange.Parse(x.Key), x => x.Value) ?? [];
+    var specialCallouts = soundConfig.SpecialCallout ?? [];
+    barInfo = SanitizeBarInfo(barInfo, barConfig, soundConfig.GlobalSpecialHandling ?? []);
     CreateAudioTrack(
-        CollectionsMarshal.AsSpan(clicks),
-        importantBars.AsSpan(),
-        file,
+        reportBuilder,
+        CollectionsMarshal.AsSpan(barInfo),
+        soundConfig.ImportantBars.AsSpan(),
+        specialCallouts,
+        soundConfig.MidiFilePath,
         cache
     );
+    
+    reportBuilder.AppendLine();
 }
+
+File.WriteAllText(Path.Combine(firstFileDir ?? ".", "Report.txt"), reportBuilder.ToString());
 
 foreach (var allocation in cache.Values) allocation.Dispose();
 cache.Clear();
 
 return;
-
-const int PrepareTimes = 2;
 
 static List<ClickInfo> CreateClickInfo(string midiFilePath)
 {
@@ -77,13 +107,13 @@ static List<ClickInfo> CreateClickInfo(string midiFilePath)
 
     var oneBeatMetricLength = LengthConverter.ConvertTo<MetricTimeSpan>(oneBeatMusicalLength, 0, sourceTempoMap);
     
-    for (var i = 0; i < currentTimeSignature.Numerator * PrepareTimes; i++)
+    for (var i = 0; i < currentTimeSignature.Numerator * Constants.PrepareTimes; i++)
     {
         clickInfos.Add(new((ulong)(i * oneBeatMetricLength.TotalMicroseconds),
             i % currentTimeSignature.Numerator == 0 ? ClickType.PreparePrimary : ClickType.PrepareSecondary));
     }
 
-    var offsetMicroseconds = oneBeatMetricLength.TotalMicroseconds * currentTimeSignature.Numerator * PrepareTimes;
+    var offsetMicroseconds = oneBeatMetricLength.TotalMicroseconds * currentTimeSignature.Numerator * Constants.PrepareTimes;
     long currentMidiTime = 0;
     var remainingBeats = currentTimeSignature.Numerator;
     while (currentMidiTime < maxMidiClicks)
@@ -117,65 +147,200 @@ static List<ClickInfo> CreateClickInfo(string midiFilePath)
     return clickInfos;
 }
 
-static MusicalTimeSpan GetOneBeatMusicalLength(TimeSignature timeSignature)
-{
-    return new(1, timeSignature.Denominator);
-}
+static MusicalTimeSpan GetOneBeatMusicalLength(TimeSignature timeSignature) => new(1, timeSignature.Denominator);
 
-static void CreateAudioTrack(ReadOnlySpan<ClickInfo> clickInfo, ReadOnlySpan<int> importantBarNumber, string dstPath,
-    Dictionary<int, AudioFileReaderAllocation> cache)
+static List<BarInfo> AnalyzeClickInfo(List<ClickInfo> clickInfos, Dictionary<int, int> restartCallout)
 {
-    var clickSequencer = new WaveSequencer();
-    var voiceSequencer = new WaveSequencer();
-    const uint VoiceOffset = 200_000;
-    var barNumber = 0;
-    var prepareVoiceNumber = 1;
-    var remainingCountDownBars = PrepareTimes;
-    var importantSet = new HashSet<int>();
-    foreach (var bar in importantBarNumber)
+    var bars = new List<BarInfo>();
+    var currentBarType = BarType.Prepare;
+    var currentBarNumber = 0;
+    var currentBarClicks = new List<ClickInfo>();
+    foreach (var click in clickInfos)
     {
-        importantSet.Add(bar);
-        importantSet.Add(bar - 1);
-        importantSet.Add(bar - 2);
-    }
-
-    foreach (var click in clickInfo)
-    {
-        const string primaryClickPath = "ClickPrimary.wav";
-        const string secondaryClickPath = "ClickSecondary.wav";
-        AudioFileReader clickSample;
-        AudioFileReader? voiceSample = null;
         switch (click.Type)
         {
-            case ClickType.Primary:
-                barNumber++;
-                clickSample = new(primaryClickPath);
-                if (importantSet.Contains(barNumber)) voiceSample = GetNumberVoice(barNumber, cache);
-                break;
-            case ClickType.Secondary:
-                clickSample = new(secondaryClickPath);
-                break;
             case ClickType.PreparePrimary:
-                remainingCountDownBars--;
-                prepareVoiceNumber = 1;
-                clickSample = new(primaryClickPath);
-                if (remainingCountDownBars == 0) voiceSample = GetNumberVoice(1, cache);
+                if (currentBarType != BarType.Prepare)
+                    throw new InvalidOperationException("PreparePrimary click found after normal bar started.");
+                if (currentBarClicks.Count > 0)
+                {
+                    bars.Add(new(currentBarType, currentBarNumber, currentBarClicks.ToArray(), currentBarNumber == Constants.PrepareTimes ? 1 : -1));
+                    currentBarClicks.Clear();
+                }
+                currentBarNumber++;
                 break;
             case ClickType.PrepareSecondary:
-                prepareVoiceNumber++;
-                clickSample = new(secondaryClickPath);
-                if (remainingCountDownBars == 0) voiceSample = GetNumberVoice(prepareVoiceNumber, cache);
+                if (currentBarType != BarType.Prepare)
+                    throw new InvalidOperationException("PrepareSecondary click found after normal bar started.");
+                break;
+            case ClickType.Primary:
+                if (currentBarType == BarType.Prepare)
+                {
+                    if (currentBarClicks.Count > 0)
+                    {
+                        bars.Add(new(currentBarType, currentBarNumber, currentBarClicks.ToArray(), currentBarNumber == Constants.PrepareTimes ? 1 : -1));
+                        currentBarClicks.Clear();
+                    }
+                    currentBarType = BarType.Normal;
+                    currentBarNumber = 1;
+                }
+                else
+                {
+                    if (currentBarClicks.Count > 0)
+                    {
+                        bars.Add(new(currentBarType, currentBarNumber, currentBarClicks.ToArray(), restartCallout.GetValueOrDefault(currentBarNumber, -1)));
+                        currentBarClicks.Clear();
+                    }
+                    currentBarNumber++;
+                }
+
+                break;
+            case ClickType.Secondary:
+                if (currentBarType == BarType.Prepare)
+                    throw new InvalidOperationException("Secondary click found before normal bar started.");
                 break;
             case ClickType.Final:
-                clickSample = new(primaryClickPath);
-                break;
+                continue;
             default:
                 throw new UnreachableException();
         }
 
-        clickSequencer.AddSample(clickSample, (long)(click.Microsecond + VoiceOffset));
-        if (voiceSample == null) continue;
-        voiceSequencer.AddSample(voiceSample, (long)click.Microsecond);
+        currentBarClicks.Add(click);
+    }
+
+    return bars;
+}
+
+static List<BarInfo> SanitizeBarInfo(List<BarInfo> barInfos, Dictionary<BarRange, SpecialHandling[]> perBarSpecialHandling, SpecialHandling[] globalSpecialHandling)
+{
+    if (barInfos.Count == 0) return barInfos;
+    var sanitized = new List<BarInfo>();
+    var barSpecialHandling = new HashSet<SpecialHandling>();
+    foreach (var barInfo in barInfos)
+    {
+        barSpecialHandling.Clear();
+        barSpecialHandling.UnionWith(globalSpecialHandling);
+        foreach (var data in perBarSpecialHandling)
+        {
+            if (!data.Key.IsInRange(barInfo.BarNumber, barInfo.Type == BarType.Prepare)) continue;
+            barSpecialHandling.UnionWith(data.Value);
+        }
+        
+        if (barSpecialHandling.Contains(SpecialHandling.Handle68AsGroupOf3) && barInfo.ClickInfos.Length == 6)
+        {
+            var clickInfo = barInfo.ClickInfos[3];
+            barInfo.ClickInfos[3] = 
+                clickInfo with
+                {
+                    Type = 
+                    barInfo.Type == BarType.Prepare
+                        ? ClickType.PreparePrimary
+                        : ClickType.Primary
+                };
+        }
+
+        if (barSpecialHandling.Contains(SpecialHandling.ByPassQuantization))
+        {
+            continue;
+        }
+        
+        if (TimeSpan.FromMicroseconds(barInfo.AverageBeatIntervalMicroseconds).TotalSeconds > 0.3)
+        {
+            sanitized.Add(barInfo);
+            continue;
+        }
+
+        ReadOnlySpan<int> takeIndex = barInfo.ClickInfos.Length switch
+        {
+            18 => [0, 3, 6, 9, 12, 15],
+            12 => [0, 3, 6, 9],
+            9 => [0, 3, 6],
+            6 => [0, 3],
+            4 => [0, 2],
+            3 => [0],
+            _ => throw new InvalidOperationException($"Unexpected number of clicks in a bar: {barInfo}")
+        };
+
+        var clicks = new ClickInfo[takeIndex.Length];
+        for (var i = 0; i < takeIndex.Length; i++)
+            clicks[i] = barInfo.ClickInfos[takeIndex[i]];
+        
+        sanitized.Add(new(barInfo.Type, barInfo.BarNumber, clicks, barInfo.VoiceCountStartClick));
+    }
+    return sanitized;
+}
+
+static void CreateAudioTrack(
+    StringBuilder reportBuilder,
+    ReadOnlySpan<BarInfo> barInfo,
+    ReadOnlySpan<int> importantBarNumber, 
+    ReadOnlySpan<int> specialCalloutBarNumber, 
+    string dstPath,
+    Dictionary<int, AudioFileReaderAllocation> cache)
+{
+    var clickSequencer = new WaveSequencer();
+    var voiceSequencer = new WaveSequencer();
+    const uint VoiceOffset = 100_000;
+    var calloutSet = new HashSet<int>();
+    var importantSet = new HashSet<int>();
+    foreach (var bar in importantBarNumber)
+    {
+        calloutSet.Add(bar);
+        importantSet.Add(bar);
+        calloutSet.Add(bar - 1);
+        calloutSet.Add(bar - 2);
+    }
+
+    foreach (var bar in specialCalloutBarNumber)
+    {
+        importantSet.Add(bar);
+        calloutSet.Add(bar);
+    }
+
+    const string primaryClickPath = "ClickPrimary.wav";
+    const string secondaryClickPath = "ClickSecondary.wav";
+    
+    foreach (var bar in barInfo)
+    {
+        switch (bar.Type)
+        {
+            case BarType.Prepare:
+            {
+                for (var index = 0; index < bar.ClickInfos.Length; index++)
+                {
+                    var clickInfo = bar.ClickInfos[index];
+                    var barMicrosecondClick = (long)clickInfo.Microsecond;
+                    clickSequencer.AddSample(new(clickInfo.Type is ClickType.PreparePrimary or ClickType.Primary ? primaryClickPath : secondaryClickPath), barMicrosecondClick + VoiceOffset);
+                    if(bar.VoiceCountStartClick == -1) continue;
+                    var currentClickNumber = index + 1;
+                    if(currentClickNumber < bar.VoiceCountStartClick) continue;
+                    voiceSequencer.AddSample(GetNumberVoice(currentClickNumber - bar.VoiceCountStartClick + 1, cache), barMicrosecondClick);
+                }
+                break;
+            }
+            case BarType.Normal:
+            {
+                for (var index = 0; index < bar.ClickInfos.Length; index++)
+                {
+                    var clickInfo = bar.ClickInfos[index];
+                    var barMicrosecondClick = (long)clickInfo.Microsecond;
+                    clickSequencer.AddSample(new(clickInfo.Type is ClickType.PreparePrimary or ClickType.Primary ? primaryClickPath : secondaryClickPath), barMicrosecondClick + VoiceOffset);
+                    if (index == 0 && calloutSet.Contains(bar.BarNumber))
+                    {
+                        if(importantSet.Contains(bar.BarNumber))
+                            reportBuilder.Append(bar.BarNumber).Append(": ").Append(TimeSpan.FromMicroseconds(barMicrosecondClick).ToString(@"mm\:ss")).AppendLine();
+                        voiceSequencer.AddSample(GetNumberVoice(bar.BarNumber, cache), barMicrosecondClick);
+                    }
+                    if(bar.VoiceCountStartClick == -1) continue;
+                    var currentClickNumber = index + 1;
+                    if(currentClickNumber < bar.VoiceCountStartClick) continue;
+                    voiceSequencer.AddSample(GetNumberVoice(currentClickNumber - bar.VoiceCountStartClick + 1, cache), barMicrosecondClick);
+                }  
+                break;
+            }
+            default:
+                throw new UnreachableException();
+        }
     }
 
     var clickFile = Path.ChangeExtension(dstPath, ".click.wav");
@@ -201,6 +366,36 @@ static AudioFileReader GetNumberVoice(int number, Dictionary<int, AudioFileReade
     allocation = new(path);
     cachedAllocations[number] = allocation;
     return allocation.CreateReader();
+}
+
+readonly record struct BarRange(int From, int To, bool IsPre)
+{
+    public bool IsInRange(int barNumber, bool isPrepare) => 
+        isPrepare == IsPre && barNumber >= From && barNumber <= To;
+    
+    public static BarRange Parse(string text)
+    {
+        var isPre = text.StartsWith("Pre");
+        if(isPre) text = text[3..];
+        
+        var parts = text.Split('-');
+        switch (parts.Length)
+        {
+            case 1:
+            {
+                var single = int.Parse(parts[0]);
+                return new(single, single, isPre);
+            }
+            case 2:
+            {
+                var from = int.Parse(parts[0]);
+                var to = int.Parse(parts[1]);
+                return from > to ? throw new ArgumentException("From must not be greater than To.") : new(from, to, isPre);
+            }
+            default:
+                throw new ArgumentException("Invalid BarRange format.");
+        }
+    }
 }
 
 public readonly struct AudioFileReaderAllocation : IDisposable
@@ -242,22 +437,55 @@ public enum ClickType
     Final,
 }
 
-internal readonly record struct ClickInfo(
+readonly record struct ClickInfo(
     ulong Microsecond,
     ClickType Type
 );
 
-internal record struct TimeSignatureEvent(long MidiTime, TimeSignature TimeSignature);
+enum BarType
+{
+    Prepare,
+    Normal,
+}
 
-public record SoundConfig(string MidiFilePath, int[] ImportantBars);
+readonly record struct BarInfo(
+    BarType Type,
+    int BarNumber,
+    ClickInfo[] ClickInfos,
+    int VoiceCountStartClick
+)
+{
+    public long AverageBeatIntervalMicroseconds =>
+        ClickInfos.Length > 1 
+            ? ((long)ClickInfos[^1].Microsecond - (long)ClickInfos[0].Microsecond) / (ClickInfos.Length - 1) 
+            : 0;
+    public override string ToString() => $"{Type}[{BarNumber}]:{ClickInfos.Length}x{TimeSpan.FromMicroseconds(AverageBeatIntervalMicroseconds).TotalSeconds:00.00}";
+}
 
-public record struct SoundConfigProfile(SoundConfig[] Configs);
+record struct TimeSignatureEvent(long MidiTime, TimeSignature TimeSignature);
+
+record struct SoundConfig(
+    string MidiFilePath, 
+    int[] ImportantBars,
+    Dictionary<string, SpecialHandling[]>? PerBarSpecialHandling,
+    SpecialHandling[]? GlobalSpecialHandling,
+    int[]? SpecialCallout,
+    Dictionary<int, int>? RestartCallout
+);
+
+enum SpecialHandling
+{
+    Handle68AsGroupOf3,
+    ByPassQuantization,
+}
+
+record struct SoundConfigProfile(SoundConfig[] Configs);
 
 [JsonSerializable(typeof(SoundConfigProfile))]
-[JsonSourceGenerationOptions(WriteIndented = true)]
-public partial class SerializerContext : JsonSerializerContext;
+[JsonSourceGenerationOptions(WriteIndented = true, UseStringEnumConverter = true)]
+partial class SerializerContext : JsonSerializerContext;
 
-public class WaveSequencer
+class WaveSequencer
 {
     private record struct Sample(AudioFileReader Provider, long MicrosecondPosition);
     private readonly List<Sample> _samples = [];
@@ -299,7 +527,7 @@ public class WaveSequencer
     private class AudioTrack
     {
         private long _headMicrosecondPosition;
-        private readonly List<OffsetSampleProvider> _samples = [];
+        private readonly List<ISampleProvider> _samples = [];
 
         public bool TryAppendSample(AudioFileReader provider, long requestedStartPosition)
         {
@@ -317,4 +545,9 @@ public class WaveSequencer
 
         public ConcatenatingSampleProvider CreateSampleProvider() => new(_samples);
     }
+}
+
+static class Constants
+{
+    public const int PrepareTimes = 2;
 }
