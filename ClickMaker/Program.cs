@@ -1,11 +1,9 @@
 ﻿using System.Diagnostics;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Schema;
 using System.Text.Json.Serialization;
-using System.Transactions;
 using Melanchall.DryWetMidi.Core;
 using Melanchall.DryWetMidi.Interaction;
 using NAudio.Wave;
@@ -41,7 +39,8 @@ if (!File.Exists(configFilePath))
                 PerBarSpecialHandling: null,
                 GlobalSpecialHandling: null,
                 SpecialCallout: [],
-                RestartCallout: []
+                RestartCallout: [],
+                CustomStopAt: null
             ),
             new(
                 MidiFilePath: "Example2.mid",
@@ -49,7 +48,8 @@ if (!File.Exists(configFilePath))
                 PerBarSpecialHandling: new() { { "100", [SpecialHandling.Handle68AsGroupOf3] } },
                 GlobalSpecialHandling: [SpecialHandling.Handle68AsGroupOf3],
                 SpecialCallout: [5, 6, 8],
-                RestartCallout: new() { { 1, 2 }, { 5, 1 } }
+                RestartCallout: new() { { 1, 2 }, { 5, 1 } },
+                CustomStopAt: 10
             )
         ]
     );
@@ -80,7 +80,7 @@ foreach (var soundConfig in config.Configs)
     var barInfo = AnalyzeClickInfo(clicks, soundConfig.RestartCallout ?? []);
     var barConfig = soundConfig.PerBarSpecialHandling?.ToDictionary(x => BarRange.Parse(x.Key), x => x.Value) ?? [];
     var specialCallouts = soundConfig.SpecialCallout ?? [];
-    barInfo = SanitizeBarInfo(barInfo, barConfig, soundConfig.GlobalSpecialHandling ?? []);
+    barInfo = SanitizeBarInfo(barInfo, barConfig, soundConfig.GlobalSpecialHandling ?? [], soundConfig.CustomStopAt ?? -1);
     CreateAudioTrack(
         reportBuilder,
         CollectionsMarshal.AsSpan(barInfo),
@@ -229,7 +229,7 @@ static List<BarInfo> AnalyzeClickInfo(List<ClickInfo> clickInfos, Dictionary<int
     return bars;
 }
 
-static List<BarInfo> SanitizeBarInfo(List<BarInfo> barInfos, Dictionary<BarRange, SpecialHandling[]> perBarSpecialHandling, SpecialHandling[] globalSpecialHandling)
+static List<BarInfo> SanitizeBarInfo(List<BarInfo> barInfos, Dictionary<BarRange, SpecialHandling[]> perBarSpecialHandling, SpecialHandling[] globalSpecialHandling, int specialStopAt)
 {
     if (barInfos.Count == 0) return barInfos;
     var sanitized = new List<BarInfo>();
@@ -255,6 +255,12 @@ static List<BarInfo> SanitizeBarInfo(List<BarInfo> barInfos, Dictionary<BarRange
                         ? ClickType.PreparePrimary
                         : ClickType.Primary
                 };
+        }
+
+        if (specialStopAt == barInfo.BarNumber)
+        {
+            sanitized.Add(new(barInfo.Type, barInfo.BarNumber, [barInfo.ClickInfos[0]], barInfo.VoiceCountStartClick));
+            break;
         }
 
         if (barSpecialHandling.Contains(SpecialHandling.ByPassQuantization))
@@ -488,7 +494,8 @@ record struct SoundConfig(
     Dictionary<string, SpecialHandling[]>? PerBarSpecialHandling,
     SpecialHandling[]? GlobalSpecialHandling,
     int[]? SpecialCallout,
-    Dictionary<int, int>? RestartCallout
+    Dictionary<int, int>? RestartCallout,
+    int? CustomStopAt
 );
 
 enum SpecialHandling
