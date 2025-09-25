@@ -11,7 +11,25 @@ using Melanchall.DryWetMidi.Interaction;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
 
-const string configFilePath = "Config.json";
+string? configFilePath;
+if (args.Length == 0)
+{
+    Console.WriteLine("Provide the path to the config file:");
+
+    configFilePath = Console.ReadLine();
+
+    if (configFilePath is null)
+    {
+        Console.WriteLine("Console does not support reading config file.");
+        return;
+    }
+}
+else
+{
+    configFilePath  = args[0];
+}
+
+Environment.CurrentDirectory = AppDomain.CurrentDomain.BaseDirectory;
 
 if (!File.Exists(configFilePath))
 {
