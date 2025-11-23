@@ -136,13 +136,16 @@ return;
 
 static List<ClickInfo> CreateClickInfo(string midiFilePath)
 {
+    if(!File.Exists(midiFilePath))
+        throw new FileNotFoundException("MIDI file not found.", midiFilePath);
+    
     var sourceMidiFile = MidiFile.Read(midiFilePath);
     var sourceTempoMap = sourceMidiFile.GetTempoMap();
 
     var maxMidiClicks = sourceMidiFile.Chunks
         .OfType<TrackChunk>()
         .SelectMany(trackChunk => trackChunk.GetNotes())
-        .Max(note => note.Time);
+        .Max(note => note.Time + note.Length);
 
     var timeSigChange = sourceTempoMap
         .GetTimeSignatureChanges()
@@ -273,6 +276,16 @@ static List<BarInfo> AnalyzeClickInfo(List<ClickInfo> clickInfos, Dictionary<int
                     throw new InvalidOperationException("Secondary click found before normal bar started.");
                 break;
             case ClickType.Final:
+                if (currentBarType == BarType.Prepare)
+                    throw new InvalidOperationException("Final click found before normal bar started.");
+                bars.Add(new(Type: BarType.Final,
+                    BarNumber: currentBarNumber,
+                    ClickInfos: currentBarClicks.ToArray(),
+                    VoiceCountStartClick: -1,
+                    NextBarFirstClickMicrosecond: 0,
+                    IsMerged: false
+                ));
+                currentBarClicks.Clear();
                 continue;
             default:
                 throw new UnreachableException();
@@ -296,6 +309,12 @@ static List<BarInfo> SanitizeBarInfo(
     var barSpecialHandling = new HashSet<SpecialHandling>();
     foreach (var barInfo in barInfos)
     {
+        if (barInfo.Type == BarType.Final)
+        {
+            sanitized.Add(barInfo);
+            continue;
+        }
+        
         barSpecialHandling.Clear();
         barSpecialHandling.UnionWith(globalSpecialHandling);
         foreach (var data in perBarSpecialHandling)
@@ -444,6 +463,13 @@ static void CreateAudioTrack(
                         : (long)bar.ClickInfos[index + 1].Microsecond - barMicrosecondClick;
                     voiceSequencer.AddSample(GetNumberVoice(currentClickNumber - bar.VoiceCountStartClick + 1, bar.IsMerged ? Constants.UseShortVoiceThresholdMicroseconds : clickDuration, barNumberToRehearsalMark, out var extraOffset, cache), barMicrosecondClick + extraOffset);
                 }  
+                break;
+            }
+            case BarType.Final:
+            {
+                var clickInfo = bar.ClickInfos[0];
+                var barMicrosecondClick = (long)clickInfo.Microsecond;
+                clickSequencer.AddSample(new(primaryClickPath), barMicrosecondClick + Constants.GlobalVoiceOffset);
                 break;
             }
             default:
@@ -600,6 +626,7 @@ enum BarType
 {
     Prepare,
     Normal,
+    Final,
 }
 
 readonly record struct BarInfo(
