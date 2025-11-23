@@ -27,8 +27,6 @@ else
     configFilePath  = args[0];
 }
 
-Environment.CurrentDirectory = AppDomain.CurrentDomain.BaseDirectory;
-
 if (!File.Exists(configFilePath))
 {
     var dummyConfig = new SoundConfigProfile(
@@ -66,6 +64,8 @@ if (!File.Exists(configFilePath))
     Console.WriteLine($"Config file not found. Dummy config file & schema file have been created at {Path.GetFullPath(configFilePath)}");
     return;
 }
+
+Environment.CurrentDirectory = Path.GetDirectoryName(Path.GetFullPath(configFilePath)) ?? ".";
 
 var configJson = File.ReadAllText(configFilePath);
 var config = JsonSerializer.Deserialize(configJson, SerializerContext.Default.SoundConfigProfile);
@@ -393,8 +393,8 @@ static void CreateAudioTrack(
         calloutSet.Add(bar);
     }
 
-    const string primaryClickPath = "ClickPrimary.wav";
-    const string secondaryClickPath = "ClickSecondary.wav";
+    var primaryClickPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ClickPrimary.wav");
+    var secondaryClickPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ClickSecondary.wav");
     
     foreach (var bar in barInfo)
     {
@@ -495,6 +495,7 @@ static AudioFileReader GetNumberVoice(int number, long beatLength, Dictionary<in
     else
     {
         var path = Path.Combine(
+            AppDomain.CurrentDomain.BaseDirectory,
             "VoiceBank",
             mode switch
             {
